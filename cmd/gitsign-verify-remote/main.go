@@ -21,6 +21,7 @@ import (
     rekarpkg "github.com/sigstore/gitsign/pkg/rekor"
     rekclient "github.com/sigstore/rekor/pkg/client"
     "github.com/sigstore/sigstore/pkg/cryptoutils"
+    fulcioroots "github.com/sigstore/sigstore/pkg/fulcioroots"
 )
 
 type verification struct {
@@ -246,8 +247,17 @@ func verifyCertClaims(ctx context.Context, cert *x509.Certificate, r *rekarpkg.C
     if err != nil {
         return err
     }
+    roots, err := fulcioroots.Get()
+    if err != nil {
+        return err
+    }
+    inters, err := fulcioroots.GetIntermediates()
+    if err != nil {
+        return err
+    }
     check := &cosign.CheckOpts{
-        // RootCerts and IntermediateCerts omitted intentionally to avoid internal deps.
+        RootCerts:                    roots,
+        IntermediateCerts:            inters,
         CTLogPubKeys:                 ctpub,
         RekorPubKeys:                 r.PublicKeys(),
         CertGithubWorkflowTrigger:    opts.CertGithubWorkflowTrigger,
