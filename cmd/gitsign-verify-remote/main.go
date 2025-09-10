@@ -2,6 +2,9 @@ package main
 
 import (
     "context"
+    "crypto/sha1" // #nosec G505 - fingerprinting only
+    "crypto/x509"
+    "encoding/hex"
     "encoding/json"
     "errors"
     "flag"
@@ -13,9 +16,11 @@ import (
     "time"
 
     cosignopts "github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
-    "github.com/sigstore/gitsign/internal/commands/verify"
-    "github.com/sigstore/gitsign/internal/config"
-    "github.com/sigstore/gitsign/internal/gitsign"
+    "github.com/sigstore/cosign/v2/pkg/cosign"
+    gitpkg "github.com/sigstore/gitsign/pkg/git"
+    rekarpkg "github.com/sigstore/gitsign/pkg/rekor"
+    rekclient "github.com/sigstore/rekor/pkg/client"
+    "github.com/sigstore/sigstore/pkg/cryptoutils"
 )
 
 type verification struct {
@@ -187,35 +192,108 @@ func main() {
     opts.CertGithubWorkflowRef = *ghaRef
     opts.IgnoreSCT = *ignoreSCT
 
-    // Load gitsign config (env/defaults). This does not require a local .git.
-    // If unavailable, fall back to defaults.
-    var cfg *config.Config
-    if c, err := config.Get(); err == nil {
-        cfg = c
-    } else {
-        // Defaults matching config.Get defaults
-        cfg = &config.Config{
-            Fulcio:    "https://fulcio.sigstore.dev",
-            Rekor:     "https://rekor.sigstore.dev",
-            ClientID:  "sigstore",
-            Issuer:    "https://oauth2.sigstore.dev/auth",
-            RekorMode: "online",
-        }
-    }
-
-    // Verify using gitsign verifier
-    v, err := gitsign.NewVerifierWithCosignOpts(ctx, cfg, &opts)
+    // Create verifiers without internal packages.
+    // - Git verifier with Fulcio roots from TUF.
+    gitverifier, err := gitpkg.NewDefaultVerifier(ctx)
     if err != nil {
-        fmt.Fprintln(os.Stderr, "error creating verifier:", err)
+        fmt.Fprintln(os.Stderr, "error creating git verifier:", err)
         os.Exit(1)
     }
-    summary, err := v.Verify(ctx, []byte(payload), []byte(signature), true)
+
+    // - Rekor client (allow override via env, else default).
+    rekorURL := firstNonEmpty(
+        os.Getenv("GITSIGN_REKOR_URL"),
+        os.Getenv("SIGSTORE_REKOR_URL"),
+        // historical envs
+        os.Getenv("GITSIGN_REKOR"),
+        "https://rekor.sigstore.dev",
+    )
+    rclient, err := rekarpkg.NewWithOptions(ctx, rekorURL, rekarpkg.WithClientOption(rekclient.WithUserAgent("gitsign")))
+    if err != nil {
+        fmt.Fprintln(os.Stderr, "failed to create rekor client:", err)
+        os.Exit(1)
+    }
+
+    // Verify signature + transparency log.
+    summary, err := gitpkg.Verify(ctx, gitverifier, rclient, []byte(payload), []byte(signature), true)
     if err != nil {
         fmt.Fprintln(os.Stderr, "verification failed:", err)
         os.Exit(1)
     }
 
-    // Print result like `gitsign verify`
-    verify.PrintSummary(os.Stdout, summary)
+    // Optionally verify certificate claims via cosign using provided flags.
+    if err := verifyCertClaims(ctx, summary.Cert, rclient, &opts); err != nil {
+        // Mark claim as false and continue printing summary.
+        summary.Claims = append(summary.Claims, gitpkg.NewClaim(gitpkg.ClaimValidatedCerificate, false))
+    } else {
+        summary.Claims = append(summary.Claims, gitpkg.NewClaim(gitpkg.ClaimValidatedCerificate, true))
+    }
+
+    // Print result summary.
+    printSummary(os.Stdout, summary)
 }
 
+// verifyCertClaims validates the signing certificate against cosign-style claim options.
+func verifyCertClaims(ctx context.Context, cert *x509.Certificate, r *rekarpkg.Client, opts *cosignopts.CertVerifyOptions) error {
+    if cert == nil || opts == nil {
+        return nil
+    }
+    ctpub, err := cosign.GetCTLogPubs(ctx)
+    if err != nil {
+        return err
+    }
+    identities, err := opts.Identities()
+    if err != nil {
+        return err
+    }
+    check := &cosign.CheckOpts{
+        // RootCerts and IntermediateCerts omitted intentionally to avoid internal deps.
+        CTLogPubKeys:                 ctpub,
+        RekorPubKeys:                 r.PublicKeys(),
+        CertGithubWorkflowTrigger:    opts.CertGithubWorkflowTrigger,
+        CertGithubWorkflowSha:        opts.CertGithubWorkflowSha,
+        CertGithubWorkflowName:       opts.CertGithubWorkflowName,
+        CertGithubWorkflowRepository: opts.CertGithubWorkflowRepository,
+        CertGithubWorkflowRef:        opts.CertGithubWorkflowRef,
+        Identities:                   identities,
+        IgnoreSCT:                    opts.IgnoreSCT,
+    }
+    _, err = cosign.ValidateAndUnpackCert(cert, check)
+    return err
+}
+
+func firstNonEmpty(vals ...string) string {
+    for _, v := range vals {
+        if strings.TrimSpace(v) != "" {
+            return v
+        }
+    }
+    return ""
+}
+
+func certHexFingerprint(cert *x509.Certificate) string {
+    if cert == nil || len(cert.Raw) == 0 {
+        return ""
+    }
+    sum := sha1.Sum(cert.Raw) // #nosec G401 - fingerprinting only
+    return hex.EncodeToString(sum[:])
+}
+
+// printSummary renders a verification summary similar to `gitsign verify`.
+func printSummary(w io.Writer, summary *gitpkg.VerificationSummary) {
+    if summary == nil || summary.Cert == nil {
+        fmt.Fprintln(w, "verification summary unavailable")
+        return
+    }
+    fpr := certHexFingerprint(summary.Cert)
+    if summary.LogEntry != nil && summary.LogEntry.LogIndex != nil {
+        fmt.Fprintln(w, "tlog index:", *summary.LogEntry.LogIndex)
+    }
+    ce := cosign.CertExtensions{Cert: summary.Cert}
+    fmt.Fprintf(w, "gitsign: Signature made using certificate ID 0x%s | %v\n", fpr, summary.Cert.Issuer)
+    fmt.Fprintf(w, "gitsign: Good signature from %v(%s)\n", cryptoutils.GetSubjectAlternateNames(summary.Cert), ce.GetIssuer())
+
+    for _, c := range summary.Claims {
+        fmt.Fprintf(w, "%s: %t\n", string(c.Key), c.Value)
+    }
+}
